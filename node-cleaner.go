@@ -102,10 +102,10 @@ func (m model) deleteDirs() tea.Cmd {
 		for _, dir := range m.dirs {
 			// if not modified in the last 2 months, delete
 			if dir.ModTime.Before(time.Now().AddDate(0, -2, 0)) {
-				/* err := os.RemoveAll(dir.Path)
+				err := os.RemoveAll(dir.Path)
 				if err != nil {
 					m.err = err
-				} */
+				}
 				// remove the dir from the list
 				m.dirs = append(m.dirs[:0], m.dirs[1:]...)
 			}
