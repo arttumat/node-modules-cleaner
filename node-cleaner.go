@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
@@ -18,17 +19,17 @@ const (
 
 type model struct {
 	spinner     spinner.Model
-	quitting    bool
 	loadingWd   bool
 	viewingWd   bool
 	loadingNode bool
 	viewingNode bool
-	deleting    bool
+	deleting    map[int]struct{}
 	cursor      int
 	deleted     map[int]struct{}
 	err         error
 	result      string
 	totalSize   int64
+	direct      bool
 	dirs        []dirInfo
 	curPage     int
 	totalPage   int
@@ -40,29 +41,16 @@ type dirInfo struct {
 	Size    int64
 }
 
-type GotNodeDirsMsg struct {
-	Dirs      []dirInfo
-	TotalSize int64
-}
-
-type GotWdDirsMsg struct {
-	Dirs []dirInfo
-}
-
-type DeletionSuccessMsg struct {
-	RemainingSize int64
-}
-
-func initialModel() model {
+func initialModel(direct bool) model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	return model{
 		spinner:     s,
-		loadingWd:   true,
-		loadingNode: false,
-		deleting:    false,
-		quitting:    false,
+		loadingWd:   !direct,
+		loadingNode: direct,
+		deleting:    make(map[int]struct{}),
+		direct:      direct,
 		err:         nil,
 		result:      "",
 		dirs:        []dirInfo{},
@@ -71,16 +59,22 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		spinner.Tick,
-		m.getDirsInWd(),
-	)
+	if m.direct {
+		return tea.Batch(
+			spinner.Tick,
+			m.getNodeDirs(os.Args[2]),
+		)
+	} else {
+		return tea.Batch(
+			spinner.Tick,
+			m.getDirsInWd(),
+		)
+	}
 }
 
 func (m model) getDirsInWd() tea.Cmd {
 	return func() tea.Msg {
 		startingPath := os.Args[1]
-		fmt.Printf("Current path: %s\n", startingPath)
 		var dirs = []dirInfo{}
 		err := filepath.WalkDir(startingPath, func(path string, item fs.DirEntry, err error) error {
 			if err != nil {
@@ -154,50 +148,16 @@ func (m model) getNodeDirs(searchPath string) tea.Cmd {
 	}
 }
 
-func (m model) deleteDirs() tea.Cmd {
-	return func() tea.Msg {
-		for _, dir := range m.dirs {
-			// if not modified in the last 2 months, delete
-			if dir.ModTime.Before(time.Now().AddDate(0, -2, 0)) {
-				/* err := os.RemoveAll(dir.Path)
-				if err != nil {
-					m.err = err
-				} */
-				// remove the dir from the list
-				m.dirs = append(m.dirs[:0], m.dirs[1:]...)
-			}
-		}
-		// get the total size of the remaining directories
-		var remainingSize int64
-		for _, dir := range m.dirs {
-			err := filepath.WalkDir(dir.Path, func(path string, info fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				fileInfo, _ := info.Info()
-				if !info.IsDir() {
-					remainingSize += fileInfo.Size()
-				}
-				return err
-			})
-			if err != nil {
-				m.err = err
-			}
-		}
-		return DeletionSuccessMsg{
-			RemainingSize: remainingSize,
-		}
-	}
-}
-
 func (m model) deleteDir(path string) tea.Cmd {
 	return func() tea.Msg {
-		/* err := os.RemoveAll(path)
-		   if err != nil {
-		       m.err = err
-		   } */
-		fmt.Printf("Deleted %s\n", path)
-		return nil
+		m.deleting[m.cursor] = struct{}{}
+		err := os.RemoveAll(path)
+		if err != nil {
+			m.err = err
+		}
+		return DeletionSuccessMsg{
+			DeletedSize: m.dirs[m.cursor].Size,
+		}
 	}
 }
 
@@ -212,7 +172,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// These keys should exit the program.
 		case "ctrl+c", "q", "n":
-			m.quitting = true
 			return m, tea.Quit
 		// Press enter to list all node_modules directories
 		case "enter":
@@ -226,12 +185,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.viewingNode {
 				return m, m.deleteDir(m.dirs[m.cursor].Path)
 			}
-		case "y":
-			m.deleting = true
-			return m, tea.Batch(
-				spinner.Tick,
-				m.deleteDirs(),
-			)
 		// The "up" and "k" keys move the cursor up
 		case "up", "k":
 			if m.cursor > 0 {
@@ -240,8 +193,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// The "down" and "j" keys move the cursor down
 		case "down", "j":
-			if m.cursor < len(m.dirs)-1 {
-				m.cursor++
+			if len(m.dirs) < CountPerPage {
+				if m.cursor < len(m.dirs)-1 {
+					m.cursor++
+				}
+			} else {
+				if m.cursor < CountPerPage-1 {
+					m.cursor++
+				}
 			}
 		case "pgdown":
 			if m.curPage < m.totalPage-1 {
@@ -272,12 +231,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case DeletionSuccessMsg:
-		m.deleting = false
-		m.result = fmt.Sprintf("Deleted %.2f GB\n\n", float64(m.totalSize-msg.RemainingSize)/(1<<30))
+		delete(m.deleting, m.cursor)
+		m.deleted[m.cursor] = struct{}{}
 		return m, nil
 	}
 
-	if m.loadingNode || m.loadingWd || m.deleting {
+	if m.loadingNode || m.loadingWd {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
@@ -299,13 +258,13 @@ func (m model) View() string {
 	if m.loadingNode {
 		return fmt.Sprintf("%s Loading node_modules in selected directory", m.spinner.View())
 	}
-	if m.deleting {
-		return fmt.Sprintf("%s Deleting directories", m.spinner.View())
-	}
 	if len(m.dirs) > 0 {
 		// Iterate over our choices
 		var s string
 		s += fmt.Sprintf("current page: %d, total pages: %d \n", m.curPage, m.totalPage)
+		if m.direct {
+			s += fmt.Sprintln("Direct mode")
+		}
 		for i, dir := range m.dirs[start:end] {
 
 			// Is the cursor pointing at this choice?
@@ -322,10 +281,16 @@ func (m model) View() string {
 				checked = style.Render("DELETED") // selected!
 			}
 
+			deleting := " "
+			if _, ok := m.deleting[i]; ok {
+				var style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
+				deleting = style.Render(fmt.Sprintf("%s DELETING", m.spinner.View()))
+			}
+
 			// Render the row
 			if m.viewingNode {
 				var style = lipgloss.NewStyle().Align(lipgloss.Right)
-				s += fmt.Sprintln(style.Render(fmt.Sprintf("%s [%s] %s\t %.2f MB", cursor, checked, dir.Path, float64(dir.Size)/(1<<20))))
+				s += fmt.Sprintln(style.Render(fmt.Sprintf("%s [%s%s] %s\t %.2f MB", cursor, checked, deleting, dir.Path, float64(dir.Size)/(1<<20))))
 			} else {
 				var style = lipgloss.NewStyle().Align(lipgloss.Right)
 				s += fmt.Sprintln(style.Render(fmt.Sprintf("%s - %s", cursor, dir.Path)))
@@ -338,13 +303,17 @@ func (m model) View() string {
 		}
 		return s
 	} else {
-		return "\n\nPress enter to list all node_modules directories\n\nPress q to quit.\n"
+		return "Something went wrong, please try again.\n\nMake sure to format the call in one of the following formats:\n\n" +
+			"Directly looking up node_modules folders in given path:\tnode-cleaner -d <path>\n" +
+			"List folders in given path and look for folders in the selected directory:\tnode-cleaner <path>\n"
 	}
 }
 
 func main() {
+	direct := flag.Bool("direct", false, "directly look up node_modules")
+	flag.Parse()
 	p := tea.NewProgram(
-		initialModel(),
+		initialModel(*direct),
 		tea.WithAltScreen(),       // use the full size of the terminal in its "alternate screen buffer"
 		tea.WithMouseCellMotion(), // turn on mouse support so we can track the mouse wheel
 	)
