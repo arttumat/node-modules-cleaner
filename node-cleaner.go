@@ -1,7 +1,9 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,15 +13,26 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+const (
+	CountPerPage = 15
+)
+
 type model struct {
-	spinner   spinner.Model
-	quitting  bool
-	loading   bool
-	deleting  bool
-	err       error
-	result    string
-	totalSize int64
-	dirs      []dirInfo
+	spinner     spinner.Model
+	loadingWd   bool
+	viewingWd   bool
+	loadingNode bool
+	viewingNode bool
+	deleting    map[int]struct{}
+	cursor      int
+	deleted     map[int]struct{}
+	err         error
+	result      string
+	totalSize   int64
+	direct      bool
+	dirs        []dirInfo
+	curPage     int
+	totalPage   int
 }
 
 type dirInfo struct {
@@ -28,50 +41,84 @@ type dirInfo struct {
 	Size    int64
 }
 
-type GotDirsMsg struct {
-	Dirs      []dirInfo
-	TotalSize int64
-}
-
-type DeletionSuccessMsg struct {
-	RemainingSize int64
-}
-
-func initialModel() model {
+func initialModel(direct bool) model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	return model{
-		spinner:  s,
-		loading:  false,
-		deleting: false,
-		quitting: false,
-		err:      nil,
-		result:   "",
-		dirs:     []dirInfo{},
+		spinner:     s,
+		loadingWd:   !direct,
+		loadingNode: direct,
+		deleting:    make(map[int]struct{}),
+		direct:      direct,
+		err:         nil,
+		result:      "",
+		dirs:        []dirInfo{},
+		deleted:     make(map[int]struct{}),
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	if m.direct {
+		return tea.Batch(
+			spinner.Tick,
+			m.getNodeDirs(os.Args[2]),
+		)
+	} else {
+		return tea.Batch(
+			spinner.Tick,
+			m.getDirsInWd(),
+		)
+	}
 }
 
-func (m model) getDirs() tea.Cmd {
+func (m model) getDirsInWd() tea.Cmd {
 	return func() tea.Msg {
-		home, _ := os.UserHomeDir()
+		startingPath := os.Args[1]
 		var dirs = []dirInfo{}
-		err := filepath.Walk(home, func(path string, info os.FileInfo, err error) error {
+		err := filepath.WalkDir(startingPath, func(path string, item fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if item.IsDir() && path != startingPath {
+				var dir dirInfo
+				fileInfo, _ := item.Info()
+				dir = dirInfo{
+					ModTime: fileInfo.ModTime(),
+					Path:    path,
+					Size:    fileInfo.Size(),
+				}
+				dirs = append(dirs, dir)
+				return filepath.SkipDir
+			}
+			return err
+		})
+		if err != nil {
+			m.err = err
+		}
+		return GotWdDirsMsg{Dirs: dirs}
+	}
+}
+
+func (m model) getNodeDirs(searchPath string) tea.Cmd {
+	return func() tea.Msg {
+		m.cursor = 0
+		m.curPage = 0
+		var dirs = []dirInfo{}
+		err := filepath.WalkDir(searchPath, func(path string, item fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			var dir dirInfo
-			if info.IsDir() && info.Name() == "node_modules" {
+			fileInfo, _ := item.Info()
+			if item.IsDir() && item.Name() == "node_modules" {
 				dir = dirInfo{
-					ModTime: info.ModTime(),
+					ModTime: fileInfo.ModTime(),
 					Path:    path,
-					Size:    info.Size(),
+					Size:    fileInfo.Size(),
 				}
 				dirs = append(dirs, dir)
+				return filepath.SkipDir
 			}
 			return err
 		})
@@ -79,55 +126,37 @@ func (m model) getDirs() tea.Cmd {
 			m.err = err
 		}
 		var totalSize int64
-		for _, dir := range dirs {
-			err := filepath.Walk(dir.Path, func(path string, info os.FileInfo, err error) error {
+		for i, dir := range dirs {
+			var dirSize int64
+			err := filepath.WalkDir(dir.Path, func(path string, info fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
 				if !info.IsDir() {
-					totalSize += info.Size()
+					fileInfo, _ := info.Info()
+					totalSize += fileInfo.Size()
+					dirSize += fileInfo.Size()
 				}
 				return err
 			})
 			if err != nil {
 				m.err = err
 			}
+			dirs[i].Size = dirSize
 		}
-		return GotDirsMsg{Dirs: dirs, TotalSize: totalSize}
+		return GotNodeDirsMsg{Dirs: dirs, TotalSize: totalSize}
 	}
 }
 
-func (m model) deleteDirs() tea.Cmd {
+func (m model) deleteDir(path string) tea.Cmd {
 	return func() tea.Msg {
-		for _, dir := range m.dirs {
-			// if not modified in the last 2 months, delete
-			if dir.ModTime.Before(time.Now().AddDate(0, -2, 0)) {
-				err := os.RemoveAll(dir.Path)
-				if err != nil {
-					m.err = err
-				}
-				// remove the dir from the list
-				m.dirs = append(m.dirs[:0], m.dirs[1:]...)
-			}
-		}
-		// get the total size of the remaining directories
-		var remainingSize int64
-		for _, dir := range m.dirs {
-			err := filepath.Walk(dir.Path, func(path string, info os.FileInfo, err error) error {
-				if err != nil {
-					return err
-				}
-				if !info.IsDir() {
-					remainingSize += info.Size()
-				}
-				return err
-			})
-			if err != nil {
-				m.err = err
-			}
+		m.deleting[m.cursor] = struct{}{}
+		err := os.RemoveAll(path)
+		if err != nil {
+			m.err = err
 		}
 		return DeletionSuccessMsg{
-			RemainingSize: remainingSize,
+			DeletedSize: m.dirs[m.cursor].Size,
 		}
 	}
 }
@@ -143,37 +172,71 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// These keys should exit the program.
 		case "ctrl+c", "q", "n":
-			m.quitting = true
 			return m, tea.Quit
 		// Press enter to list all node_modules directories
 		case "enter":
-			m.loading = true
-			return m, tea.Batch(
-				spinner.Tick,
-				m.getDirs(),
-			)
-		case "y":
-			m.deleting = true
-			return m, tea.Batch(
-				spinner.Tick,
-				m.deleteDirs(),
-			)
+			if m.viewingWd {
+				m.loadingNode = true
+				return m, tea.Batch(
+					spinner.Tick,
+					m.getNodeDirs(m.dirs[m.cursor].Path),
+				)
+			}
+			if m.viewingNode {
+				return m, m.deleteDir(m.dirs[m.cursor].Path)
+			}
+		// The "up" and "k" keys move the cursor up
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+
+		// The "down" and "j" keys move the cursor down
+		case "down", "j":
+			if len(m.dirs) < CountPerPage {
+				if m.cursor < len(m.dirs)-1 {
+					m.cursor++
+				}
+			} else {
+				if m.cursor < CountPerPage-1 {
+					m.cursor++
+				}
+			}
+		case "pgdown":
+			if m.curPage < m.totalPage-1 {
+				m.curPage++
+			}
+			return m, nil
+		case "pgup":
+			if m.curPage > 0 {
+				m.curPage--
+			}
+			return m, nil
 		}
-	case GotDirsMsg:
-		m.loading = false
+	case GotNodeDirsMsg:
+		m.loadingNode = false
+		m.viewingNode = true
 		// print total size in gigabytes
 		m.result = fmt.Sprintf("Total size: %.2f GB\n\nDelete everything not modified in the last 2 months? y/n", float64(msg.TotalSize)/(1<<30))
 		m.dirs = msg.Dirs
 		m.totalSize = msg.TotalSize
+		m.totalPage = (len(msg.Dirs) + CountPerPage - 1) / CountPerPage
+		return m, nil
+
+	case GotWdDirsMsg:
+		m.loadingWd = false
+		m.viewingWd = true
+		m.dirs = msg.Dirs
+		m.totalPage = (len(msg.Dirs) + CountPerPage - 1) / CountPerPage
 		return m, nil
 
 	case DeletionSuccessMsg:
-		m.deleting = false
-		m.result = fmt.Sprintf("Deleted %.2f GB\n\n", float64(m.totalSize-msg.RemainingSize)/(1<<30))
+		delete(m.deleting, m.cursor)
+		m.deleted[m.cursor] = struct{}{}
 		return m, nil
 	}
 
-	if m.loading || m.deleting {
+	if m.loadingNode || m.loadingWd {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
@@ -185,22 +248,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.loading {
-		return fmt.Sprintf("%s Loading directories", m.spinner.View())
+	start, end := m.curPage*CountPerPage, (m.curPage+1)*CountPerPage
+	if end > len(m.dirs) {
+		end = len(m.dirs)
 	}
-	if m.deleting {
-		return fmt.Sprintf("%s Deleting directories", m.spinner.View())
+	if m.loadingWd {
+		return fmt.Sprintf("%s Loading working directory", m.spinner.View())
 	}
-	if len(m.result) > 0 {
-		return m.result
+	if m.loadingNode {
+		return fmt.Sprintf("%s Loading node_modules in selected directory", m.spinner.View())
+	}
+	if len(m.dirs) > 0 {
+		// Iterate over our choices
+		var s string
+		s += fmt.Sprintf("current page: %d, total pages: %d \n", m.curPage, m.totalPage)
+		if m.direct {
+			s += fmt.Sprintln("Direct mode")
+		}
+		for i, dir := range m.dirs[start:end] {
+
+			// Is the cursor pointing at this choice?
+			cursor := " " // no cursor
+			if m.cursor == i {
+				var style = lipgloss.NewStyle().Foreground(lipgloss.Color("201"))
+				cursor = style.Render(">") // cursor!
+			}
+
+			// Is this choice selected?
+			checked := " " // not selected
+			if _, ok := m.deleted[i]; ok {
+				var style = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+				checked = style.Render("DELETED") // selected!
+			}
+
+			deleting := " "
+			if _, ok := m.deleting[i]; ok {
+				var style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF0000"))
+				deleting = style.Render(fmt.Sprintf("%s DELETING", m.spinner.View()))
+			}
+
+			// Render the row
+			if m.viewingNode {
+				var style = lipgloss.NewStyle().Align(lipgloss.Right)
+				s += fmt.Sprintln(style.Render(fmt.Sprintf("%s [%s%s] %s\t %.2f MB", cursor, checked, deleting, dir.Path, float64(dir.Size)/(1<<20))))
+			} else {
+				var style = lipgloss.NewStyle().Align(lipgloss.Right)
+				s += fmt.Sprintln(style.Render(fmt.Sprintf("%s - %s", cursor, dir.Path)))
+			}
+		}
+		if m.totalPage > 1 {
+			var style = lipgloss.NewStyle().Foreground(lipgloss.Color("#3C3C3C"))
+			s += style.Render("Pagedown to next page, pageup to prev page.")
+			s += "\n"
+		}
+		return s
 	} else {
-		return "\n\nPress enter to list all node_modules directories\n\nPress q to quit.\n"
+		return "Something went wrong, please try again.\n\nMake sure to format the call in one of the following formats:\n\n" +
+			"Directly looking up node_modules folders in given path:\tnode-cleaner -d <path>\n" +
+			"List folders in given path and look for folders in the selected directory:\tnode-cleaner <path>\n"
 	}
 }
 
 func main() {
+	direct := flag.Bool("direct", false, "directly look up node_modules")
+	flag.Parse()
 	p := tea.NewProgram(
-		initialModel(),
+		initialModel(*direct),
 		tea.WithAltScreen(),       // use the full size of the terminal in its "alternate screen buffer"
 		tea.WithMouseCellMotion(), // turn on mouse support so we can track the mouse wheel
 	)
