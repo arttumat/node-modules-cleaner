@@ -311,14 +311,19 @@ func (m model) View() string {
 
 func main() {
 	direct := flag.Bool("direct", false, "directly look up node_modules")
+	gui := flag.Bool("gui", false, "use gui")
 	flag.Parse()
-	p := tea.NewProgram(
-		initialModel(*direct),
-		tea.WithAltScreen(),       // use the full size of the terminal in its "alternate screen buffer"
-		tea.WithMouseCellMotion(), // turn on mouse support so we can track the mouse wheel
-	)
-	if err := p.Start(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
+	if *gui {
+		mainFyne()
+	} else {
+		p := tea.NewProgram(
+			initialModel(*direct),
+			tea.WithAltScreen(),       // use the full size of the terminal in its "alternate screen buffer"
+			tea.WithMouseCellMotion(), // turn on mouse support so we can track the mouse wheel
+		)
+		if err := p.Start(); err != nil {
+			fmt.Printf("Alas, there's been an error: %v", err)
+			os.Exit(1)
+		}
 	}
 }
